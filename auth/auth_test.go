@@ -169,19 +169,28 @@ func TestAuthAndScopedCrud(t *testing.T) {
 	user.Create(ctx, model.W{"name": "Root", "email": "root@x.in", "password": mustHash("r00t")})
 
 	// ---- auth
-	s, b := alice.call("POST", "/register", map[string]string{"name": "Alice", "email": "alice@x.in", "password": "pa55"})
+	s, b := alice.call("POST", "/register", map[string]string{"name": "Alice", "email": "alice@x.in", "password": "pa55word"})
 	check("register", s, b, 200, func(v any) bool { return m(v)["email"] == "alice@x.in" })
 	aliceID := n(m(b)["id"])
-	s, b = anon.call("POST", "/register", map[string]string{"email": "alice@x.in", "password": "x"})
+	s, b = anon.call("POST", "/register", map[string]string{"email": "alice@x.in", "password": "another-pw"})
 	check("email taken", s, b, 422, func(v any) bool { return m(v)["email"] == "Email Already Taken" })
 	s, b = anon.call("POST", "/register", map[string]string{"email": "", "password": ""})
 	check("register needs email and password", s, b, 422, nil)
 	stored, _ := user.Find(ctx, "alice@x.in", "email")
-	if ok, rehash := auth.Verify("pa55", fmt.Sprint(stored["password"])); !ok || rehash || !strings.HasPrefix(fmt.Sprint(stored["password"]), "$2a$10$") {
+	if ok, rehash := auth.Verify("pa55word", fmt.Sprint(stored["password"])); !ok || rehash || !strings.HasPrefix(fmt.Sprint(stored["password"]), "$2a$10$") {
 		t.Errorf("register should store bcrypt cost 10, got %v", stored["password"])
 	}
-	s, b = anon.call("POST", "/register", map[string]string{"email": "long@x.in", "password": strings.Repeat("x", 73)})
-	check("register refuses passwords over 72 bytes", s, b, 422, nil)
+	hindi := "मेरा पासवर्ड बहुत लंबा और सुरक्षित है" // 99 bytes: over bcrypt's 72
+	s, _ = newBrowser(t, base).call("POST", "/register", map[string]string{"email": "hindi@x.in", "password": hindi})
+	check("register a long Hindi password", s, nil, 200, nil)
+	s, _ = newBrowser(t, base).call("POST", "/login", map[string]string{"email": "hindi@x.in", "password": hindi})
+	check("and log in with it", s, nil, 200, nil)
+	s, _ = newBrowser(t, base).call("POST", "/login", map[string]string{"email": "hindi@x.in", "password": hindi[:72]})
+	check("its first 72 bytes are not enough", s, nil, 401, nil)
+	s, b = anon.call("POST", "/register", map[string]string{"email": "long@x.in", "password": strings.Repeat("x", 129)})
+	check("register refuses over 128 characters, saying nothing about hashing", s, b, 422, func(v any) bool { return m(v)["password"] == "Password is too long" })
+	s, b = anon.call("POST", "/register", map[string]string{"email": "short@x.in", "password": "12345"})
+	check("register refuses under 6 characters", s, b, 422, func(v any) bool { return m(v)["password"] == "Password must be at least 6 characters" })
 
 	s, b = anon.call("POST", "/login", map[string]string{"email": "alice@x.in", "password": "wrong"})
 	check("wrong password", s, b, 401, is("Password is Incorrect"))
@@ -268,7 +277,7 @@ func TestAuthAndScopedCrud(t *testing.T) {
 	check("row gone", 200, gone == nil, 200, is(true))
 
 	// ---- column safety
-	s, b = bob.call("POST", "/isuper/user/where", map[string]any{"password": mustHash("pa55"), "nope": 1})
+	s, b = bob.call("POST", "/isuper/user/where", map[string]any{"password": mustHash("pa55word"), "nope": 1})
 	check("where ignores password and unknown columns, never returns passwords", s, b, 200, func(v any) bool {
 		l, _ := v.([]any)
 		for _, r := range l {
@@ -276,7 +285,7 @@ func TestAuthAndScopedCrud(t *testing.T) {
 				return false
 			}
 		}
-		return len(l) == 6 // root, alice, bob, carol, dave, erin
+		return len(l) == 7 // root, alice, hindi, bob, carol, dave, erin
 	})
 	s, b = alice.call("POST", "/islogin/book", "not an object")
 	check("bad JSON body", s, b, 422, func(v any) bool { return strings.HasPrefix(fmt.Sprint(v), "Invalid JSON body") })

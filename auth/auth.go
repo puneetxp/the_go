@@ -15,9 +15,11 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/sha3"
@@ -47,20 +49,51 @@ func Routes() []router.Route {
 
 // Password hashing shared by every adapter (spec/auth_cases.json): bcrypt,
 // cost 10. Hashes from the Deno, PHP and Go adapters verify in each other.
+//
+// bcrypt reads only 72 bytes, so a longer password is first reduced to
+// base64(SHA3-256(password)), 44 characters (BcryptInput). Every byte of a long
+// password counts, and the stored hash is still a plain bcrypt string.
+//
+// A new password must have 6 to 128 characters (NewPasswordError); the
+// messages say nothing about how passwords are stored.
 const (
 	Cost     = 10
-	MaxBytes = 72 // bcrypt reads only the first 72 bytes; longer is refused
+	MinChars = 6
+	MaxChars = 128
+
+	bcryptMaxBytes = 72
 )
 
-// ErrTooLong: the password is over MaxBytes.
-var ErrTooLong = fmt.Errorf("Password must be at most %d bytes", MaxBytes)
+// ErrTooLong: the password has more than MaxChars characters.
+var ErrTooLong = errors.New("Password is too long")
+
+// NewPasswordError says why a new password can't be used, or "" when it can.
+func NewPasswordError(password string) string {
+	switch n := utf8.RuneCountInString(password); {
+	case n < MinChars:
+		return fmt.Sprintf("Password must be at least %d characters", MinChars)
+	case n > MaxChars:
+		return ErrTooLong.Error()
+	}
+	return ""
+}
+
+// BcryptInput is what bcrypt is given: the password, or base64(SHA3-256) of
+// it when it is over 72 bytes.
+func BcryptInput(password string) []byte {
+	if len(password) <= bcryptMaxBytes {
+		return []byte(password)
+	}
+	sum := sha3.Sum256([]byte(password))
+	return []byte(base64.StdEncoding.EncodeToString(sum[:]))
+}
 
 // Hash is the bcrypt hash to store for password.
 func Hash(password string) (string, error) {
-	if len(password) > MaxBytes {
+	if utf8.RuneCountInString(password) > MaxChars {
 		return "", ErrTooLong
 	}
-	h, err := bcrypt.GenerateFromPassword([]byte(password), Cost)
+	h, err := bcrypt.GenerateFromPassword(BcryptInput(password), Cost)
 	return string(h), err
 }
 
@@ -72,7 +105,7 @@ func Verify(password, stored string) (ok, rehash bool) {
 		return false, false
 	}
 	if strings.HasPrefix(stored, "$2") {
-		if bcrypt.CompareHashAndPassword([]byte(stored), []byte(password)) != nil {
+		if bcrypt.CompareHashAndPassword([]byte(stored), BcryptInput(password)) != nil {
 			return false, false
 		}
 		cost, err := bcrypt.Cost([]byte(stored))
@@ -203,10 +236,11 @@ func Register(c *router.Ctx) error {
 	} else if existing != nil {
 		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"email": "Email Already Taken"})
 	}
+	if msg := NewPasswordError(in.Password); msg != "" {
+		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"password": msg})
+	}
 	hash, err := Hash(in.Password)
-	if err == ErrTooLong {
-		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"password": err.Error()})
-	} else if err != nil {
+	if err != nil {
 		return err
 	}
 	u, err := user.Create(c.Context(), model.W{"name": in.Name, "email": email, "password": hash})
