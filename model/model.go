@@ -59,6 +59,17 @@ func Lookup(name string) *Model {
 	return registry[name]
 }
 
+// Models returns every defined model, in name order.
+func Models() []*Model {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	out := make([]*Model, 0, len(registry))
+	for _, name := range sortedKeys(registry) {
+		out = append(out, registry[name])
+	}
+	return out
+}
+
 // Query starts an empty query on the model.
 func (m *Model) Query() *Query { return &Query{m: m} }
 
