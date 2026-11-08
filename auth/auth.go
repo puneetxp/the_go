@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"strings"
 
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/sha3"
 
 	"github.com/puneetxp/the_go/model"
@@ -44,22 +45,46 @@ func Routes() []router.Route {
 	}
 }
 
-// Hash is the password hash every adapter stores: SHA3-256, base64 (the_deno).
-func Hash(password string) string {
-	sum := sha3.Sum256([]byte(password))
-	return base64.StdEncoding.EncodeToString(sum[:])
+// Password hashing shared by every adapter (spec/auth_cases.json): bcrypt,
+// cost 10. Hashes from the Deno, PHP and Go adapters verify in each other.
+const (
+	Cost     = 10
+	MaxBytes = 72 // bcrypt reads only the first 72 bytes; longer is refused
+)
+
+// ErrTooLong: the password is over MaxBytes.
+var ErrTooLong = fmt.Errorf("Password must be at most %d bytes", MaxBytes)
+
+// Hash is the bcrypt hash to store for password.
+func Hash(password string) (string, error) {
+	if len(password) > MaxBytes {
+		return "", ErrTooLong
+	}
+	h, err := bcrypt.GenerateFromPassword([]byte(password), Cost)
+	return string(h), err
 }
 
-// Verify checks password against a stored hash: the_deno's base64 SHA3-256,
-// or the_lib's (PHP) hex SHA3-256.
-func Verify(password, stored string) bool {
+// Verify checks password against a stored hash. rehash says the hash should
+// be replaced (an old unsalted SHA3-256, the_deno base64 or the_lib hex, or a
+// bcrypt of another cost), which Login does once the password is known good.
+func Verify(password, stored string) (ok, rehash bool) {
+	if stored == "" {
+		return false, false
+	}
+	if strings.HasPrefix(stored, "$2") {
+		if bcrypt.CompareHashAndPassword([]byte(stored), []byte(password)) != nil {
+			return false, false
+		}
+		cost, err := bcrypt.Cost([]byte(stored))
+		return true, err != nil || cost != Cost
+	}
 	sum := sha3.Sum256([]byte(password))
 	for _, want := range []string{base64.StdEncoding.EncodeToString(sum[:]), hex.EncodeToString(sum[:])} {
 		if subtle.ConstantTimeCompare([]byte(want), []byte(stored)) == 1 {
-			return true
+			return true, true
 		}
 	}
-	return false
+	return false, false
 }
 
 func models() (user, activeRole, role *model.Model, err error) {
@@ -140,8 +165,17 @@ func Login(c *router.Ctx) error {
 		return c.JSON(http.StatusForbidden, "This account has been disabled")
 	}
 	stored, _ := u["password"].(string)
-	if stored == "" || !Verify(in.Password, stored) {
+	ok, rehash := Verify(in.Password, stored)
+	if !ok {
 		return c.JSON(http.StatusUnauthorized, "Password is Incorrect")
+	}
+	if rehash {
+		// An old SHA3 hash: store bcrypt now that the password is known.
+		if h, err := Hash(in.Password); err == nil {
+			if _, err := user.Where(model.W{"id": u["id"]}).Update(c.Context(), model.W{"password": h}); err != nil {
+				return err
+			}
+		}
 	}
 	login, err := loginFor(c, u)
 	if err != nil {
@@ -169,7 +203,13 @@ func Register(c *router.Ctx) error {
 	} else if existing != nil {
 		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"email": "Email Already Taken"})
 	}
-	u, err := user.Create(c.Context(), model.W{"name": in.Name, "email": email, "password": Hash(in.Password)})
+	hash, err := Hash(in.Password)
+	if err == ErrTooLong {
+		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"password": err.Error()})
+	} else if err != nil {
+		return err
+	}
+	u, err := user.Create(c.Context(), model.W{"name": in.Name, "email": email, "password": hash})
 	if err != nil {
 		return err
 	}

@@ -138,6 +138,14 @@ func (b *browser) call(method, path string, body any) (int, any) {
 	return res.StatusCode, out
 }
 
+func mustHash(p string) string {
+	h, err := auth.Hash(p)
+	if err != nil {
+		panic(err)
+	}
+	return h
+}
+
 func m(v any) map[string]any { x, _ := v.(map[string]any); return x }
 func n(v any) int64 {
 	f, _ := v.(float64)
@@ -158,7 +166,7 @@ func TestAuthAndScopedCrud(t *testing.T) {
 
 	// User 1 passes every role check (as in the Deno and PHP adapters), so the
 	// install's root account comes first, before anyone registers.
-	user.Create(ctx, model.W{"name": "Root", "email": "root@x.in", "password": auth.Hash("r00t")})
+	user.Create(ctx, model.W{"name": "Root", "email": "root@x.in", "password": mustHash("r00t")})
 
 	// ---- auth
 	s, b := alice.call("POST", "/register", map[string]string{"name": "Alice", "email": "alice@x.in", "password": "pa55"})
@@ -169,7 +177,11 @@ func TestAuthAndScopedCrud(t *testing.T) {
 	s, b = anon.call("POST", "/register", map[string]string{"email": "", "password": ""})
 	check("register needs email and password", s, b, 422, nil)
 	stored, _ := user.Find(ctx, "alice@x.in", "email")
-	check("password stored as the_deno's hash", 200, stored["password"], 200, is(auth.Hash("pa55")))
+	if ok, rehash := auth.Verify("pa55", fmt.Sprint(stored["password"])); !ok || rehash || !strings.HasPrefix(fmt.Sprint(stored["password"]), "$2a$10$") {
+		t.Errorf("register should store bcrypt cost 10, got %v", stored["password"])
+	}
+	s, b = anon.call("POST", "/register", map[string]string{"email": "long@x.in", "password": strings.Repeat("x", 73)})
+	check("register refuses passwords over 72 bytes", s, b, 422, nil)
 
 	s, b = anon.call("POST", "/login", map[string]string{"email": "alice@x.in", "password": "wrong"})
 	check("wrong password", s, b, 401, is("Password is Incorrect"))
@@ -183,16 +195,23 @@ func TestAuthAndScopedCrud(t *testing.T) {
 	check("profile has no password", s, b, 200, func(v any) bool { _, has := m(v)["password"]; return !has && m(v)["name"] == "Alice" })
 
 	// bob is an isuper; carol is disabled
-	bobRow, _ := user.Create(ctx, model.W{"name": "Bob", "email": "bob@x.in", "password": auth.Hash("b0b")})
+	bobRow, _ := user.Create(ctx, model.W{"name": "Bob", "email": "bob@x.in", "password": mustHash("b0b")})
 	role, _ := model.Lookup("role").Create(ctx, model.W{"name": "isuper"})
 	model.Lookup("active_role").Create(ctx, model.W{"user_id": bobRow["id"], "role_id": role["id"]})
-	user.Create(ctx, model.W{"name": "Carol", "email": "carol@x.in", "password": auth.Hash("c"), "enable": 0})
+	user.Create(ctx, model.W{"name": "Carol", "email": "carol@x.in", "password": mustHash("c"), "enable": 0})
 	s, b = anon.call("POST", "/login", map[string]string{"email": "carol@x.in", "password": "c"})
 	check("disabled user", s, b, 403, is("This account has been disabled"))
 	// PHP stores hex: those users log in too
 	user.Create(ctx, model.W{"name": "Dave", "email": "dave@x.in", "password": "ab33dcadcb33e257f2a6fd6bd7aaca676ab6e9eaf89daa5dd1a97e744b306e04"})
 	s, _ = newBrowser(t, base).call("POST", "/login", map[string]string{"email": "dave@x.in", "password": "s3cret-Pä55"})
 	check("a PHP-hashed password logs in", s, nil, 200, nil)
+	dave, _ := user.Find(ctx, "dave@x.in", "email")
+	check("an old SHA3 hash is upgraded to bcrypt at login", 200, strings.HasPrefix(fmt.Sprint(dave["password"]), "$2a$10$"), 200, is(true))
+	user.Create(ctx, model.W{"name": "Erin", "email": "erin@x.in", "password": "qzPcrcsz4lfypv1r16rKZ2q26er4napd0al+dEswbgQ="})
+	s, _ = newBrowser(t, base).call("POST", "/login", map[string]string{"email": "erin@x.in", "password": "s3cret-Pä55"})
+	check("a the_deno SHA3 (base64) password logs in", s, nil, 200, nil)
+	s, _ = newBrowser(t, base).call("POST", "/login", map[string]string{"email": "dave@x.in", "password": "s3cret-Pä55"})
+	check("and logs in again after the upgrade", s, nil, 200, nil)
 	s, b = bob.call("POST", "/login", map[string]string{"email": "bob@x.in", "password": "b0b"})
 	check("login loads roles", s, b, 200, func(v any) bool { return fmt.Sprint(m(v)["roles"]) == "[isuper]" })
 
@@ -249,7 +268,7 @@ func TestAuthAndScopedCrud(t *testing.T) {
 	check("row gone", 200, gone == nil, 200, is(true))
 
 	// ---- column safety
-	s, b = bob.call("POST", "/isuper/user/where", map[string]any{"password": auth.Hash("pa55"), "nope": 1})
+	s, b = bob.call("POST", "/isuper/user/where", map[string]any{"password": mustHash("pa55"), "nope": 1})
 	check("where ignores password and unknown columns, never returns passwords", s, b, 200, func(v any) bool {
 		l, _ := v.([]any)
 		for _, r := range l {
@@ -257,7 +276,7 @@ func TestAuthAndScopedCrud(t *testing.T) {
 				return false
 			}
 		}
-		return len(l) == 5 // root, alice, bob, carol, dave
+		return len(l) == 6 // root, alice, bob, carol, dave, erin
 	})
 	s, b = alice.call("POST", "/islogin/book", "not an object")
 	check("bad JSON body", s, b, 422, func(v any) bool { return strings.HasPrefix(fmt.Sprint(v), "Invalid JSON body") })
