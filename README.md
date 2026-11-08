@@ -59,3 +59,39 @@ import "github.com/puneetxp/the_go/utils/file"
 f := file.Init("../storage")
 result := f.Upload(multipartFile, header, "custom_name")
 ```
+
+### 3. Routes and auth
+
+The same route tree as the_deno, on the standard library's `http.ServeMux`
+(no router dependency):
+
+```go
+r, err := router.New(append([]router.Route{
+    {Islogin: true, Child: []router.Route{
+        {Path: "/islogin/book", Crud: &router.Crud{Model: models.Book, Can: "acrudw", Owner: "user_id"}},
+        {Path: "/islogin/book/:book_id/client", Crud: &router.Crud{Model: models.Client, Can: "acrud",
+            Under: &router.Under{Parent: models.Book, Param: "book_id", Owner: "user_id"}}},
+        {Path: "/isuper", Roles: []string{"isuper"}, Child: isuperRoutes},
+    }},
+}, auth.Routes()...), router.Options{Origins: []string{"https://app.example.com"}})
+http.ListenAndServe(":9000", r)
+```
+
+**Routes:**
+- `Islogin`, `Roles` and `Guard` pass down to child routes, and `Group` maps a method to its routes.
+- A wrong path or method gets a JSON 404, and a handler panic gets a JSON 500.
+
+**`Crud`:** the letters `a r c w u p d` give the same URLs as the_deno, including `/where` and `/perma_delete/:id` (isuper only).
+- `Owner` limits rows to the logged-in user, and `Under` to a parent row in the URL that the user owns.
+- Someone else's row is a 404.
+- Passwords are never sent, and `/where` filters only on the model's columns.
+
+**Sessions:** server-side, in the `PHPSESSID` cookie (as in the Deno and PHP adapters), bound to the user agent.
+- `MemoryStore` is the default; plug in a shared `session.Store` when several processes serve one app.
+- API keys can use `Options.Bearer`.
+
+**Auth:** `auth.Routes()` gives `GET`/`POST /login`, `POST /register`, `GET /logout` and `GET /profile`, using the app's `user`, `active_role` and `role` models.
+- Passwords use the_deno's SHA3-256 (base64); the_lib's hex form logs in too.
+- User 1 passes every role check, as in the other adapters.
+
+**Generated apps:** compile-php writes `go/routes/generated.go` from the models' `crud` entries, with the same 503 routes and access rules as its Deno output for the_billing. `main.go`, `routes/routes.go` and `routes/custom.go` are the app's own and are never overwritten.
