@@ -73,7 +73,7 @@ r, err := router.New(append([]router.Route{
             Under: &router.Under{Parent: models.Book, Param: "book_id", Owner: "user_id"}}},
         {Path: "/isuper", Roles: []string{"isuper"}, Child: isuperRoutes},
     }},
-}, auth.Routes()...), router.Options{Origins: []string{"https://app.example.com"}})
+}, auth.Routes()...), router.Options{CORS: true, Origins: []string{"https://app.example.com"}})
 http.ListenAndServe(":9000", r)
 ```
 
@@ -91,7 +91,23 @@ http.ListenAndServe(":9000", r)
 - API keys can use `Options.Bearer`.
 
 **Auth:** `auth.Routes()` gives `GET`/`POST /login`, `POST /register`, `GET /logout` and `GET /profile`, using the app's `user`, `active_role` and `role` models.
-- Passwords use the_deno's SHA3-256 (base64); the_lib's hex form logs in too.
+- Passwords use bcrypt; old SHA3 hashes are upgraded at login (see below).
 - User 1 passes every role check, as in the other adapters.
 
 **Generated apps:** compile-php writes `go/routes/generated.go` from the models' `crud` entries, with the same 503 routes and access rules as its Deno output for the_billing. `main.go`, `routes/routes.go` and `routes/custom.go` are the app's own and are never overwritten.
+
+## Passwords and CORS (the same in every adapter)
+
+`spec/auth_cases.json` holds the cases for both. The file is the same in the_deno, the_lib and the_go, and each adapter's tests read it.
+
+**Passwords:** bcrypt, cost 10. A hash made by any adapter logs in through the others.
+- Old unsalted SHA3-256 hashes (the_deno base64, the_lib hex) still log in, and are replaced by bcrypt at that login.
+- Passwords over 72 bytes are refused at register, because bcrypt reads only the first 72 bytes.
+
+**CORS:** a switch, off by default.
+
+| Setting | Effect |
+| --- | --- |
+| `CORS` unset or `off` | no other site may call the API with cookies; same-origin setups need nothing |
+| `CORS=on` | other sites may: any origin, for development |
+| `CORS=on` with `CORS_ORIGINS=https://a.com,https://b.com` | only those origins, for production |

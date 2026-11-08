@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -58,10 +59,29 @@ type Options struct {
 	// islogin routes. Return nil to refuse the token.
 	Bearer func(c *Ctx, token string) (*session.Login, error)
 	Log    *log.Logger
-	// Origins allowed to call the API with cookies (CORS). Empty: any origin,
-	// as the_deno does today; set it in production so other sites can't read
-	// a logged-in user's data.
+	// CORS, the same switch in every adapter (spec/auth_cases.json): off by
+	// default, so no other site can call the API with a user's cookies.
+	// With CORS on, Origins limits it to those origins; empty means any
+	// origin (development). CORSFromEnv reads both from CORS / CORS_ORIGINS.
+	CORS    bool
 	Origins []string
+}
+
+// CORSFromEnv reads the CORS switch (CORS=on|true|1|yes) and the allowed
+// origins (CORS_ORIGINS, comma separated), as every adapter does.
+func CORSFromEnv() (bool, []string) {
+	return corsSetting(os.Getenv("CORS"), os.Getenv("CORS_ORIGINS"))
+}
+
+func corsSetting(on, origins string) (bool, []string) {
+	enabled := contains([]string{"on", "true", "1", "yes"}, strings.ToLower(strings.TrimSpace(on)))
+	var list []string
+	for _, o := range strings.Split(origins, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			list = append(list, o)
+		}
+	}
+	return enabled, list
 }
 
 // Router is an http.Handler.
@@ -233,7 +253,7 @@ func muxPath(p string) string {
 // JSON 404, as in the_deno.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
-		cors(w, r, rt.opts.Origins)
+		cors(w, r, rt.opts.CORS, rt.opts.Origins)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -338,7 +358,7 @@ func (c *Ctx) JSON(status int, body any) error {
 		return errors.New("router: response already written")
 	}
 	c.wrote = true
-	cors(c.W, c.R, c.rt.opts.Origins)
+	cors(c.W, c.R, c.rt.opts.CORS, c.rt.opts.Origins)
 	if c.Session != nil {
 		c.Session.Expire = time.Now().Add(c.rt.opts.TTL)
 		if err := c.rt.opts.Sessions.Set(c.Context(), c.Session); err == nil {
@@ -376,15 +396,14 @@ func (c *Ctx) EndSession() error {
 	return nil
 }
 
-func cors(w http.ResponseWriter, r *http.Request, allowed []string) {
+// cors sets the CORS headers when CORS is on and the origin is allowed;
+// otherwise none, and the browser keeps other sites out.
+func cors(w http.ResponseWriter, r *http.Request, on bool, allowed []string) {
 	origin := r.Header.Get("Origin")
 	h := w.Header()
 	h.Add("Vary", "Origin")
-	if len(allowed) > 0 && !contains(allowed, origin) {
-		return // not an allowed origin: no CORS headers, the browser blocks it
-	}
-	if origin == "" {
-		origin = "*"
+	if !corsAllows(on, allowed, origin) {
+		return
 	}
 	h.Set("Access-Control-Allow-Origin", origin)
 	h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
@@ -400,4 +419,8 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+func corsAllows(on bool, allowed []string, origin string) bool {
+	return on && origin != "" && (len(allowed) == 0 || contains(allowed, origin))
 }

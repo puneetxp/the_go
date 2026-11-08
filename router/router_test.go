@@ -149,8 +149,8 @@ func TestAccess(t *testing.T) {
 	}
 
 	got := do(t, r, "OPTIONS", "/islogin/me", nil, map[string]string{"Origin": "https://app.example"})
-	if got.status != 204 || got.header.Get("Access-Control-Allow-Origin") != "https://app.example" {
-		t.Errorf("preflight: %d %v", got.status, got.header)
+	if got.status != 204 || got.header.Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("preflight with CORS off (the default): %d %v", got.status, got.header)
 	}
 	got = do(t, r, "GET", "/islogin/me", alice, nil)
 	if !strings.Contains(strings.Join(got.header.Values("Set-Cookie"), ";"), session.CookieName+"=") {
@@ -159,7 +159,7 @@ func TestAccess(t *testing.T) {
 }
 
 func TestOriginsAllowList(t *testing.T) {
-	r, _ := New([]Route{{Path: "/p", Handler: ok("p")}}, Options{Origins: []string{"https://intax.in"}})
+	r, _ := New([]Route{{Path: "/p", Handler: ok("p")}}, Options{CORS: true, Origins: []string{"https://intax.in"}})
 	if h := do(t, r, "GET", "/p", nil, map[string]string{"Origin": "https://evil.example"}).header; h.Get("Access-Control-Allow-Origin") != "" {
 		t.Errorf("other origin got CORS: %v", h)
 	}
