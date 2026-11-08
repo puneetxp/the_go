@@ -308,6 +308,61 @@ func (m *Model) insert(ctx context.Context, rows []W) ([]any, error) {
 	return ids, nil
 }
 
+// Upsert inserts rows, or updates the row with the same id (MySQL: any
+// unique key). Fillable columns plus id are written; every row needs the
+// same columns. Returns the driver's affected-row count.
+func (m *Model) Upsert(ctx context.Context, rows []W) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	keep := func(r W) W {
+		w := m.writable(r)
+		if id, ok := r["id"]; ok {
+			w["id"] = id
+		}
+		return w
+	}
+	cols, _ := columnsAndValues(keep(rows[0]))
+	var params []any
+	tuple := "(" + strings.Repeat("?,", len(cols)-1) + "?)"
+	tuples := make([]string, len(rows))
+	for i, r := range rows {
+		w := keep(r)
+		for _, c := range cols {
+			params = append(params, w[c])
+		}
+		tuples[i] = tuple
+	}
+	_, d, err := current()
+	if err != nil {
+		return 0, err
+	}
+	var set []string
+	for _, c := range cols {
+		if c == "id" {
+			continue
+		}
+		if d == Postgres {
+			set = append(set, Ident(c)+" = EXCLUDED."+Ident(c))
+		} else {
+			set = append(set, Ident(c)+" = VALUES("+Ident(c)+")")
+		}
+	}
+	s := "INSERT INTO " + m.Table + "( " + quoteAll(cols) + " ) VALUES " + strings.Join(tuples, ",")
+	switch {
+	case d == Postgres && len(set) > 0:
+		s += " ON CONFLICT (" + Ident("id") + ") DO UPDATE SET " + strings.Join(set, ", ")
+	case d == Postgres:
+		s += " ON CONFLICT (" + Ident("id") + ") DO NOTHING"
+	case len(set) > 0:
+		s += " ON DUPLICATE KEY UPDATE " + strings.Join(set, ", ")
+	}
+	return affected(exec(ctx, s, params))
+}
+
+// HasColumn reports whether col is one of the model's columns.
+func (m *Model) HasColumn(col string) bool { return contains(m.Columns, col) }
+
 // Update sets columns (only Fillable ones) on the rows the chain matches and
 // returns how many changed.
 func (q *Query) Update(ctx context.Context, data W) (int64, error) {
