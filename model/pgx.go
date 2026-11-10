@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -23,6 +24,9 @@ func UsePgx(pool *pgxpool.Pool) {
 }
 
 type pgxRunner struct{ pool *pgxpool.Pool }
+
+// textNumeric asks for numeric columns in the text format.
+var textNumeric = pgx.QueryResultFormatsByOID{pgtype.NumericOID: pgx.TextFormatCode}
 
 // valueFunc turns one raw column value into what database/sql would return.
 type valueFunc func(src []byte) (driver.Value, error)
@@ -117,7 +121,9 @@ func typeName(m *pgtype.Map, oid uint32) string {
 }
 
 func (p pgxRunner) query(ctx context.Context, sqlText string, params []any) ([]Row, error) {
-	rows, err := p.pool.Query(ctx, sqlText, params...)
+	// numeric comes as text: the rows want it as a string, and converting the
+	// binary form costs several allocations per value.
+	rows, err := p.pool.Query(ctx, sqlText, append([]any{textNumeric}, params...)...)
 	if err != nil {
 		return nil, err
 	}
