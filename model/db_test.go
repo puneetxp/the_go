@@ -4,6 +4,8 @@ package model
 // MySQL/MariaDB otherwise. Creates and drops the_t_items / the_t_categories.
 //   DBTEST=1 DBHOST=127.0.0.1 DBPORT=3306 DBUSER=root DBNAME=the_test go test ./model/
 //   DBTEST=1 DBDRIVER=postgres DBHOST=127.0.0.1 DBPORT=5432 DBUSER=postgres DBNAME=the_test go test ./model/
+// On PostgreSQL the models run on a pgx pool; PGX_STDLIB=1 runs them on
+// database/sql instead.
 
 import (
 	"context"
@@ -14,9 +16,18 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
+// testDB is the database/sql pool of the last openTestDB, or nil with pgxpool.
+var testDB *sql.DB
+
+// openTestDB connects every model to the test database. PostgreSQL uses a
+// pgx pool, or database/sql with PGX_STDLIB=1. PGLITE=1: PGlite serves one
+// connection, and all connections share one session, so each one drops the
+// prepared statements an earlier one left (pgx names them the same).
 func openTestDB(t testing.TB) Dialect {
 	t.Helper()
 	if os.Getenv("DBTEST") != "1" {
@@ -28,25 +39,51 @@ func openTestDB(t testing.TB) Dialect {
 		}
 		return d
 	}
-	pg := env("DBDRIVER", "mysql") == "postgres"
-	var db *sql.DB
-	var err error
-	if pg {
-		db, err = sql.Open("pgx", fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
-			env("DBUSER", "postgres"), env("DBPWD", ""), env("DBHOST", "127.0.0.1"), env("DBPORT", "5432"), env("DBNAME", "postgres")))
-		db.SetMaxOpenConns(1) // PGlite serves one connection at a time
-	} else {
-		db, err = sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?interpolateParams=true&parseTime=true",
-			env("DBUSER", "root"), env("DBPWD", ""), env("DBHOST", "127.0.0.1"), env("DBPORT", "3306"), env("DBNAME", "the_test")))
+	testDB = nil
+	if env("DBDRIVER", "mysql") == "postgres" {
+		url := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+			env("DBUSER", "postgres"), env("DBPWD", ""), env("DBHOST", "127.0.0.1"), env("DBPORT", "5432"), env("DBNAME", "postgres"))
+		pglite := os.Getenv("PGLITE") == "1"
+		if os.Getenv("PGX_STDLIB") == "1" {
+			db, err := sql.Open("pgx", url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pglite {
+				db.SetMaxOpenConns(1)
+				db.Exec("DEALLOCATE ALL")
+			}
+			t.Cleanup(func() { db.Close() })
+			testDB = db
+			Use(db, Postgres)
+			return Postgres
+		}
+		cfg, err := pgxpool.ParseConfig(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pglite {
+			cfg.MaxConns = 1
+			cfg.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
+				_, err := c.Exec(ctx, "DEALLOCATE ALL", pgx.QueryExecModeSimpleProtocol)
+				return err
+			}
+		}
+		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		UsePgx(pool)
+		return Postgres
 	}
+	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?interpolateParams=true&parseTime=true",
+		env("DBUSER", "root"), env("DBPWD", ""), env("DBHOST", "127.0.0.1"), env("DBPORT", "3306"), env("DBNAME", "the_test")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	if pg {
-		Use(db, Postgres)
-		return Postgres
-	}
+	testDB = db
 	Use(db, MySQL)
 	return MySQL
 }

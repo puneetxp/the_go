@@ -2,147 +2,9 @@ package model
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
-	"math"
-	"strconv"
 	"strings"
-	"sync"
 )
-
-var (
-	connMu  sync.RWMutex
-	conn    *sql.DB
-	dialect Dialect
-)
-
-// Use sets the connection pool every model runs on. database/sql pools and
-// reuses connections. For MySQL, add interpolateParams=true to the DSN, so a
-// query is one round trip; pgx caches prepared statements itself.
-func Use(db *sql.DB, d Dialect) {
-	connMu.Lock()
-	defer connMu.Unlock()
-	conn, dialect = db, d
-}
-
-func current() (*sql.DB, Dialect, error) {
-	connMu.RLock()
-	defer connMu.RUnlock()
-	if conn == nil {
-		return nil, dialect, errNoDB
-	}
-	return conn, dialect, nil
-}
-
-// Row is one result row: column name to value. Text and DECIMAL columns come
-// back as string, integers as int64, timestamps as time.Time.
-type Row = map[string]any
-
-func query(ctx context.Context, sqlText string, params []any) ([]Row, error) {
-	db, d, err := current()
-	if err != nil {
-		return nil, err
-	}
-	if d == Postgres {
-		sqlText = ToPostgres(sqlText)
-	}
-	rows, err := db.QueryContext(ctx, sqlText, params...)
-	if err != nil {
-		return nil, fmt.Errorf("%w\nquery: %s", err, sqlText)
-	}
-	defer rows.Close()
-	types, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, err
-	}
-	cols := make([]string, len(types))
-	conv := make([]func(any) any, len(types))
-	for i, t := range types {
-		cols[i] = t.Name()
-		conv[i] = converter(t.DatabaseTypeName())
-	}
-	out := []Row{}
-	vals := make([]any, len(cols))
-	ptrs := make([]any, len(cols))
-	for i := range vals {
-		ptrs[i] = &vals[i]
-	}
-	for rows.Next() {
-		if err := rows.Scan(ptrs...); err != nil {
-			return nil, err
-		}
-		r := make(Row, len(cols))
-		for i, c := range cols {
-			r[c] = conv[i](vals[i])
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// converter gives every driver the same value types: integers int64, FLOAT
-// and DOUBLE float64, everything else (DECIMAL included) string, timestamps
-// time.Time. The MySQL driver sends text-protocol results (interpolateParams)
-// as bytes, so the column type decides.
-func converter(dbType string) func(any) any {
-	t := strings.ToUpper(dbType)
-	switch {
-	case strings.Contains(t, "INT") || t == "YEAR" || t == "SERIAL":
-		return func(v any) any {
-			switch x := v.(type) {
-			case []byte:
-				if n, err := strconv.ParseInt(string(x), 10, 64); err == nil {
-					return n
-				}
-				return string(x) // unsigned beyond int64
-			case uint64:
-				if x <= math.MaxInt64 {
-					return int64(x)
-				}
-				return x
-			case int32:
-				return int64(x)
-			case int16:
-				return int64(x)
-			}
-			return v
-		}
-	case t == "FLOAT" || t == "DOUBLE" || t == "REAL" || t == "FLOAT4" || t == "FLOAT8":
-		return func(v any) any {
-			switch x := v.(type) {
-			case []byte:
-				if f, err := strconv.ParseFloat(string(x), 64); err == nil {
-					return f
-				}
-				return string(x)
-			case float32:
-				return float64(x)
-			}
-			return v
-		}
-	}
-	return func(v any) any {
-		if b, ok := v.([]byte); ok {
-			return string(b)
-		}
-		return v
-	}
-}
-
-func exec(ctx context.Context, sqlText string, params []any) (sql.Result, error) {
-	db, d, err := current()
-	if err != nil {
-		return nil, err
-	}
-	if d == Postgres {
-		sqlText = ToPostgres(sqlText)
-	}
-	res, err := db.ExecContext(ctx, sqlText, params...)
-	if err != nil {
-		return nil, fmt.Errorf("%w\nquery: %s", err, sqlText)
-	}
-	return res, nil
-}
 
 // ---- reading ----------------------------------------------------------------
 
@@ -404,7 +266,7 @@ func (q *Query) Toggle(ctx context.Context, column ...string) (int64, error) {
 	return affected(exec(ctx, "UPDATE "+q.m.Table+" SET "+c+" = CASE WHEN "+c+" = 0 THEN 1 ELSE 0 END"+w, params))
 }
 
-func affected(res sql.Result, err error) (int64, error) {
+func affected(res Result, err error) (int64, error) {
 	if err != nil {
 		return 0, err
 	}

@@ -4,6 +4,7 @@ package auth_test
 // PostgreSQL with DBDRIVER=postgres, MySQL/MariaDB otherwise. Creates and drops
 // the_a_* tables.
 //   DBTEST=1 DBHOST=127.0.0.1 DBPORT=3306 DBUSER=root DBNAME=the_test go test ./auth/
+// On PostgreSQL the models run on a pgx pool; PGX_STDLIB=1 uses database/sql.
 
 import (
 	"bytes"
@@ -19,6 +20,8 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/puneetxp/the_go/auth"
@@ -48,18 +51,47 @@ func setup(t *testing.T) string {
 		t.Skip("set DBTEST=1 to run against a database")
 	}
 	pg := env("DBDRIVER", "mysql") == "postgres"
-	var db *sql.DB
-	var err error
-	if pg {
-		db, err = sql.Open("pgx", fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", env("DBUSER", "postgres"), env("DBPWD", ""), env("DBHOST", "127.0.0.1"), env("DBPORT", "5432"), env("DBNAME", "postgres")))
-		db.SetMaxOpenConns(1)
-		model.Use(db, model.Postgres)
-	} else {
-		db, err = sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?interpolateParams=true&parseTime=true", env("DBUSER", "root"), env("DBPWD", ""), env("DBHOST", "127.0.0.1"), env("DBPORT", "3306"), env("DBNAME", "the_test")))
-		model.Use(db, model.MySQL)
-	}
-	if err != nil {
-		t.Fatal(err)
+	// run executes setup SQL on whichever pool the models use; closeDB ends it.
+	var run func(s string) error
+	var closeDB func()
+	switch {
+	case pg && os.Getenv("PGX_STDLIB") != "1":
+		// PostgreSQL on a pgx pool, as generated apps use it.
+		cfg, err := pgxpool.ParseConfig(fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", env("DBUSER", "postgres"), env("DBPWD", ""), env("DBHOST", "127.0.0.1"), env("DBPORT", "5432"), env("DBNAME", "postgres")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.Getenv("PGLITE") == "1" {
+			// One connection, one shared session: drop statements left by earlier ones.
+			cfg.MaxConns = 1
+			cfg.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
+				_, err := c.Exec(ctx, "DEALLOCATE ALL", pgx.QueryExecModeSimpleProtocol)
+				return err
+			}
+		}
+		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		model.UsePgx(pool)
+		run = func(s string) error { _, err := pool.Exec(context.Background(), s); return err }
+		closeDB = pool.Close
+	default:
+		var db *sql.DB
+		var err error
+		if pg {
+			db, err = sql.Open("pgx", fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", env("DBUSER", "postgres"), env("DBPWD", ""), env("DBHOST", "127.0.0.1"), env("DBPORT", "5432"), env("DBNAME", "postgres")))
+			db.SetMaxOpenConns(1)
+			model.Use(db, model.Postgres)
+		} else {
+			db, err = sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?interpolateParams=true&parseTime=true", env("DBUSER", "root"), env("DBPWD", ""), env("DBHOST", "127.0.0.1"), env("DBPORT", "3306"), env("DBNAME", "the_test")))
+			model.Use(db, model.MySQL)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		run = func(s string) error { _, err := db.Exec(s); return err }
+		closeDB = func() { db.Close() }
 	}
 	serial := "bigint unsigned AUTO_INCREMENT"
 	if pg {
@@ -68,7 +100,7 @@ func setup(t *testing.T) string {
 	tables := []string{"the_a_clients", "the_a_books", "the_a_active_roles", "the_a_roles", "the_a_users"}
 	drop := func() {
 		for _, tb := range tables {
-			db.Exec("DROP TABLE IF EXISTS " + tb)
+			run("DROP TABLE IF EXISTS " + tb)
 		}
 	}
 	drop()
@@ -79,11 +111,11 @@ func setup(t *testing.T) string {
 		"CREATE TABLE the_a_books (id " + serial + " PRIMARY KEY, name varchar(100) NOT NULL, user_id bigint NOT NULL)",
 		"CREATE TABLE the_a_clients (id " + serial + " PRIMARY KEY, name varchar(100) NOT NULL, book_id bigint NOT NULL, deleted_at timestamp NULL)",
 	} {
-		if _, err := db.Exec(s); err != nil {
+		if err := run(s); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { drop(); db.Close() })
+	t.Cleanup(func() { drop(); closeDB() })
 
 	under := &router.Under{Parent: book, Param: "book_id", Owner: "user_id"}
 	rt, err := router.New(append([]router.Route{

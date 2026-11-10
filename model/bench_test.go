@@ -44,7 +44,7 @@ func BenchmarkFind(b *testing.B) {
 	benchSetup(b)
 	ctx := context.Background()
 	b.Run("bare database/sql", func(b *testing.B) {
-		db, _, _ := current()
+		db := testDB
 		for i := 0; i < b.N; i++ {
 			rows, err := db.QueryContext(ctx, "SELECT * FROM bench_items WHERE `id` IN (?) LIMIT 1", 1+i%1000)
 			if err != nil {
@@ -66,7 +66,7 @@ func BenchmarkFind(b *testing.B) {
 		}
 	})
 	b.Run("bare database/sql, whereHas query", func(b *testing.B) {
-		db, _, _ := current()
+		db := testDB
 		q := "SELECT * FROM bench_items WHERE `id` IN (?) AND `enable` IN (?) AND EXISTS (SELECT 1 FROM bench_categories AS `bench_categories__1` WHERE `bench_categories__1`.`id` = `bench_items`.`category_id` AND (`title` IN (?)))"
 		for i := 0; i < b.N; i++ {
 			rows, err := db.QueryContext(ctx, q, 1+i%1000, 1, "b")
